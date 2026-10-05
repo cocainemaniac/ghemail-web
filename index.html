@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GHIntel - GitHub Commit Emails</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: monospace; background: #f4f4f4; color: #000; padding: 24px; }
+  .container { max-width: 860px; margin: 0 auto; }
+  header { border-bottom: 2px solid #000; padding-bottom: 12px; margin-bottom: 20px; }
+  h1 { font-size: 22px; text-transform: uppercase; letter-spacing: -1px; }
+  .panel { border: 1px solid #000; background: #fff; padding: 16px; margin-bottom: 16px; }
+  label { display: block; font-size: 11px; font-weight: bold; text-transform: uppercase; margin-bottom: 4px; }
+  input[type=text], input[type=password] {
+    width: 100%; padding: 8px; border: 1px solid #000; font-family: monospace;
+    font-size: 13px; margin-bottom: 12px; background: #fff;
+  }
+  input[type=text]:focus, input[type=password]:focus { outline: 2px solid #000; }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 12px; font-weight: bold; text-transform: uppercase; }
+  button {
+    padding: 10px 24px; border: 2px solid #000; background: #fff; font-family: monospace;
+    font-size: 13px; font-weight: bold; text-transform: uppercase; cursor: pointer; margin-right: 8px;
+  }
+  button:hover:not(:disabled) { background: #000; color: #fff; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  #log {
+    background: #0d0d0d; color: #0f0; font-size: 11px; padding: 12px; height: 140px;
+    overflow-y: auto; white-space: pre-wrap; margin-bottom: 16px; border: 1px solid #000;
+  }
+  #results { border: 1px solid #000; background: #fff; min-height: 120px; max-height: 320px; overflow-y: auto; padding: 12px; font-size: 13px; }
+  #results .empty { opacity: 0.3; text-transform: uppercase; font-size: 11px; }
+  .email-row { padding: 4px 0; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; gap: 12px; }
+  .email-row a { color: #000; }
+  .status { font-size: 11px; font-weight: bold; text-transform: uppercase; margin: 8px 0; }
+  .error { color: #b00; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>GitHub Extract: Commit Emails</h1>
+  </header>
+
+  <div class="panel">
+    <label for="username">Username / Organizace</label>
+    <input type="text" id="username" placeholder="napr. torvalds">
+
+    <label for="token">GitHub token (volitelne, vyssi rate limit)</label>
+    <input type="password" id="token" placeholder="ghp_...">
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="includeForks">
+      <label for="includeForks" style="margin:0">Zahrnout forky</label>
+    </div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="allCommits">
+      <label for="allCommits" style="margin:0">Nacist vsechny commity (bez limitu 100/repo)</label>
+    </div>
+  </div>
+
+  <div>
+    <button id="scanBtn">Scan</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <button id="csvBtn" disabled>Export CSV</button>
+    <span class="status" id="status">STATUS: IDLE</span>
+  </div>
+
+  <div class="panel" style="margin-top:16px">
+    <label>Process log</label>
+    <div id="log"></div>
+  </div>
+
+  <label>Vysledky (<span id="count">0</span> unikatnich emailu)</label>
+  <div id="results"><div class="empty">[ cekam na spusteni scanu ]</div></div>
+</div>
+
+<script>
+const API = "https://api.github.com";
+let abortFlag = false;
+let results = [];
+
+const $ = id => document.getElementById(id);
+
+function log(msg) {
+  const time = new Date().toLocaleTimeString("cs-CZ", { hour12: false });
+  const el = $("log");
+  el.textContent += `[${time}] ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+async function ghGet(url, token) {
+  const headers = { "Accept": "application/vnd.github.v3+json" };
+  if (token) headers["Authorization"] = "token " + token;
+  const resp = await fetch(url, { headers });
+  if (resp.status === 403) throw new Error("403: rate limit / zakazano. Zkus token.");
+  if (resp.status === 404) throw new Error("404: uzivatel/organizace nenalezena.");
+  if (!resp.ok) throw new Error("GitHub API chyba: " + resp.status);
+  return resp.json();
+}
+
+async function getRepos(username, token) {
+  const repos = [];
+  let page = 1;
+  while (!abortFlag) {
+    log(`Nacitam repozitare (strana ${page})...`);
+    const data = await ghGet(`${API}/users/${username}/repos?per_page=100&page=${page}`, token);
+    if (!Array.isArray(data) || data.length === 0) break;
+    repos.push(...data);
+    if (data.length < 100) break;
+    page++;
+  }
+  return repos;
+}
+
+function addResult(entry) {
+  results.push(entry);
+  $("count").textContent = results.length;
+  const row = document.createElement("div");
+  row.className = "email-row";
+  const mail = document.createElement("strong");
+  mail.textContent = entry.email;
+  const link = document.createElement("a");
+  link.href = entry.commit_url;
+  link.target = "_blank";
+  link.rel = "noreferrer";
+  link.textContent = entry.repo;
+  row.append(mail, link);
+  const box = $("results");
+  const empty = box.querySelector(".empty");
+  if (empty) empty.remove();
+  box.prepend(row);
+}
+
+async function scan() {
+  const username = $("username").value.trim();
+  const token = $("token").value.trim() || null;
+  const includeForks = $("includeForks").checked;
+  const allCommits = $("allCommits").checked;
+
+  if (!username) { alert("Zadej username."); return; }
+
+  abortFlag = false;
+  results = [];
+  $("count").textContent = "0";
+  $("results").innerHTML = '<div class="empty">[ cekam na data ]</div>';
+  $("log").textContent = "";
+  $("scanBtn").disabled = true;
+  $("stopBtn").disabled = false;
+  $("csvBtn").disabled = true;
+  $("status").textContent = "STATUS: RUNNING";
+
+  log(`Scanuji github.com/${username} ...`);
+  const seen = new Set();
+
+  try {
+    let repos = await getRepos(username, token);
+    if (!includeForks) repos = repos.filter(r => !r.fork);
+    if (repos.length === 0) { log("Zadne cilove repozitare."); return; }
+    log(`Zpracovavam ${repos.length} repozitaru.`);
+
+    for (const repo of repos) {
+      if (abortFlag) break;
+      const full = repo.full_name;
+      let page = 1;
+      while (!abortFlag) {
+        log(`Commity: ${full} (strana ${page})`);
+        let commits;
+        try {
+          commits = await ghGet(`${API}/repos/${full}/commits?per_page=100&page=${page}`, token);
+        } catch (e) {
+          log(`VAROVANI: ${full}: ${e.message}`);
+          break;
+        }
+        if (!Array.isArray(commits) || commits.length === 0) break;
+
+        for (const c of commits) {
+          const author = (c.commit && c.commit.author) || {};
+          const email = author.email;
+          if (!email || email.includes("noreply.github.com")) continue;
+          if (seen.has(email.toLowerCase())) continue;
+          seen.add(email.toLowerCase());
+          addResult({
+            email,
+            author_name: author.name || "",
+            login: (c.author && c.author.login) || "N/A",
+            repo: full,
+            date: author.date || "",
+            commit_url: c.html_url || "",
+          });
+        }
+        if (!allCommits || commits.length < 100) break;
+        page++;
+      }
+    }
+    log(abortFlag ? "SCAN UKONCEN UZIVATELEM." : `SCAN DOKONCEN. Emailu: ${results.length}`);
+  } catch (e) {
+    log("KRITICKA CHYBA: " + e.message);
+    $("status").textContent = "STATUS: ERROR";
+    $("status").className = "status error";
+  } finally {
+    $("scanBtn").disabled = false;
+    $("stopBtn").disabled = true;
+    $("csvBtn").disabled = results.length === 0;
+    if ($("status").textContent !== "STATUS: ERROR") $("status").textContent = "STATUS: IDLE";
+  }
+}
+
+function exportCsv() {
+  const header = ["Email", "Author Name", "Login", "Repo", "Date", "Commit URL"];
+  const esc = v => `"${String(v).replace(/"/g, '""')}"`;
+  const rows = results.map(r =>
+    [r.email, r.author_name, r.login, r.repo, r.date, r.commit_url].map(esc).join(","));
+  const blob = new Blob([header.join(",") + "\n" + rows.join("\n")],
+    { type: "text/csv;charset=utf-8;" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `ghintel_${$("username").value.trim()}_${Date.now()}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  log("CSV export dokoncen.");
+}
+
+$("scanBtn").addEventListener("click", scan);
+$("stopBtn").addEventListener("click", () => { abortFlag = true; log("Prijat signal ukonceni..."); });
+$("csvBtn").addEventListener("click", exportCsv);
+$("username").addEventListener("keydown", e => { if (e.key === "Enter") scan(); });
+</script>
+</body>
+</html>
